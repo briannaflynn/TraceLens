@@ -652,3 +652,104 @@ still incurs lookup overhead per call).
 | Mean wall-clock | 79 ms | 21 ms | **−73% (3.8×)** |
 | Min | — | 20.5 ms | — |
 | Max | — | 21.9 ms | — |
+
+---
+
+## TraceDiff Pass 2 — Pandas Efficiency (2026-03-10)
+
+**Goal:** Eliminate redundant pandas work in `get_df_diff_stats_unique_args` and
+replace row-wise `.apply()` calls in `get_cpu_op_to_kernels_json` with vectorized
+operations.
+
+**Baseline:** 21 ms (after Pass 1)
+**After Pass 2: 18.8 ms (−10%, 1.1×)**
+
+The Qwen trace pair is nearly identical so `diff_stats_df` only has 2 rows —
+the gains here scale with the number of unique ops in the diff (larger diffs
+with many divergent ops will see proportionally larger improvements).
+
+---
+
+### Change A — Proactive list-column stringification + eliminate "first" agg overhead
+
+| | |
+|---|---|
+| **File** | `TraceLens/TraceDiff/trace_diff.py` |
+| **Function** | `get_df_diff_stats_unique_args` |
+
+**Before:** Always-triggered `try/except TypeError` → `df_filtered.copy()` + two
+full groupby passes (one for `agg`, one for `size`), with "first" aggregation on
+every grouping column.
+
+**After:** Detect list-type columns with a vectorized `map(type).eq(list).any()`
+check; copy and stringify only those columns. Use `groupby[metric_cols].agg()`
+to aggregate metrics only, then `reset_index()` to recover grouping keys — avoids
+running pandas "first" aggregation over every non-metric column.
+
+```python
+# Before
+agg_dict = {mcol: list(agg_metrics_set) for mcol in metric_columns}
+for col in grouping_cols_original:
+    agg_dict[col] = "first"
+try:
+    df_agg = df_filtered.groupby(...).agg(agg_dict)
+    df_agg["operation_count"] = df_filtered.groupby(...).size()
+except TypeError:
+    df_temp = df_filtered.copy()
+    for col, str_col in zip(grouping_cols_original, str_cols):
+        df_temp[str_col] = df_temp[col].astype(str)
+    df_agg = df_temp.groupby(str_cols).agg(agg_dict)
+    df_agg["operation_count"] = df_temp.groupby(str_cols).size()
+
+# After
+list_cols = [col for col in grouping_cols_original
+             if df_filtered[col].map(type).eq(list).any()]
+if list_cols:
+    df_filtered = df_filtered.copy()
+    for col in list_cols:
+        df_filtered[col] = df_filtered[col].astype(str)
+grouped = df_filtered.groupby(grouping_cols_original, dropna=False)
+df_agg = grouped[metric_columns].agg(agg_dict)
+df_agg["operation_count"] = grouped.size()
+df_agg = df_agg.reset_index()   # recovers grouping keys without "first" agg
+```
+
+---
+
+### Change B — Vectorize cpu_op rename and nn_module_parent whitespace removal
+
+| | |
+|---|---|
+| **File** | `TraceLens/TraceDiff/trace_diff.py` |
+| **Function** | `get_cpu_op_to_kernels_json` → `get_cpu_op_map` |
+
+**Before:**
+```python
+def rename_cpu_op(row):
+    if row["cpu_op_name"] in rename_map:
+        return rename_map[row["cpu_op_name"]]
+    return row["cpu_op_name"]
+
+def rename_nnmodule(row):
+    return re.sub(" ", "", row["nn_module_parent"])
+
+df_agg["cpu_op_name"] = df_agg.apply(rename_cpu_op, axis=1)
+df_agg["nn_module_parent"] = df_agg.apply(rename_nnmodule, axis=1)
+```
+
+**After:**
+```python
+if rename_map:
+    df_agg["cpu_op_name"] = df_agg["cpu_op_name"].map(rename_map).fillna(df_agg["cpu_op_name"])
+df_agg["nn_module_parent"] = df_agg["nn_module_parent"].str.replace(" ", "", regex=False)
+```
+
+`Series.map(dict)` is implemented in C and avoids Python interpreter overhead
+per row. `str.replace` similarly runs in vectorized C code.
+
+**Cumulative results after both passes:**
+
+| Pass | Mean | vs original (79 ms) |
+|---|---|---|
+| Pass 1 (lru_cache + regex) | 21 ms | −73% (3.8×) |
+| Pass 2 (pandas efficiency) | 18.8 ms | **−76% (4.2×)** |

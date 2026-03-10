@@ -1217,48 +1217,34 @@ class TraceDiff:
             df_filtered = df_filtered[df_filtered["name"] == op_name]
         df_filtered = df_filtered.drop(columns=["lowest_common_ancestor_id"])
 
-        # 3. Identify “argument” columns (everything that isn’t a metric)
+        # 3. Identify "argument" columns (everything that isn't a metric)
         metric_columns = ["kernel_time"]
         grouping_cols_original = [
             c for c in df_filtered.columns if c not in metric_columns
         ]
 
-        # 4. Build aggregation dictionary - ensure sum is always included
+        # 4. Build aggregation dictionary for metrics only (grouping cols recovered via reset_index)
         agg_metrics_set = set(agg_metrics) | {"sum"}
         agg_dict = {mcol: list(agg_metrics_set) for mcol in metric_columns}
-        for col in grouping_cols_original:
-            agg_dict[col] = "first"  # keep first occurrence of each argument column
 
-        # 5. Try groupby directly; fallback to string conversion for unhashable types
-        try:
-            df_agg = df_filtered.groupby(grouping_cols_original, dropna=False).agg(
-                agg_dict
-            )
-            # Add row_count column (number of grouped rows per unique group)
-            df_agg["operation_count"] = df_filtered.groupby(
-                grouping_cols_original, dropna=False
-            ).size()
-        except TypeError:
-            # Fallback for unhashable types (lists/dicts): convert to strings
-            str_cols = [f"{col}_str_repr" for col in grouping_cols_original]
-            df_temp = df_filtered.copy()
-            for col, str_col in zip(grouping_cols_original, str_cols):
-                df_temp[str_col] = df_temp[col].astype(str)
-            df_agg = df_temp.groupby(str_cols, dropna=False).agg(agg_dict)
-            # Add row_count column for stringified grouping columns
-            df_agg["operation_count"] = df_temp.groupby(str_cols, dropna=False).size()
+        # 5. Stringify any list-type grouping columns before groupby (avoids TypeError)
+        list_cols = [
+            col for col in grouping_cols_original
+            if df_filtered[col].map(type).eq(list).any()
+        ]
+        if list_cols:
+            df_filtered = df_filtered.copy()
+            for col in list_cols:
+                df_filtered[col] = df_filtered[col].astype(str)
+        grouped = df_filtered.groupby(grouping_cols_original, dropna=False)
+        df_agg = grouped[metric_columns].agg(agg_dict)
+        df_agg["operation_count"] = grouped.size()
 
-        # 7. Flatten the multi‑index column labels
+        # 7. Flatten the multi‑index metric column labels, then recover grouping cols via reset_index
         df_agg.columns = ["_".join(col).strip() for col in df_agg.columns.values]
-        df_agg = df_agg.reset_index(drop=True)
+        df_agg = df_agg.reset_index()
 
-        # 8. Rename “_first” columns back to the original column names for clarity
-        rename_map = {}
-        for col in grouping_cols_original:
-            col_first = f"{col}_first"
-            if col_first in df_agg.columns:
-                rename_map[col_first] = col
-        df_agg = df_agg.rename(columns=rename_map)
+        # 8. (no-op: grouping cols come back via reset_index with their original names)
 
         # 9. Reorder columns: original argument columns first, then aggregated metric columns
         primary_cols = grouping_cols_original
@@ -1405,19 +1391,12 @@ class TraceDiff:
                                 )
                 return rename_map
 
-            def rename_cpu_op(row):
-                if row["cpu_op_name"] in rename_map:
-                    return rename_map[row["cpu_op_name"]]
-                return row["cpu_op_name"]
-
-            def rename_nnmodule(row):
-                return re.sub(" ", "", row["nn_module_parent"])
-
             rename_map = get_rename_map(df)
 
-            df_agg["cpu_op_name"] = df_agg.apply(rename_cpu_op, axis=1)
+            if rename_map:
+                df_agg["cpu_op_name"] = df_agg["cpu_op_name"].map(rename_map).fillna(df_agg["cpu_op_name"])
 
-            df_agg["nn_module_parent"] = df_agg.apply(rename_nnmodule, axis=1)
+            df_agg["nn_module_parent"] = df_agg["nn_module_parent"].str.replace(" ", "", regex=False)
             ##df_agg['cpu_op_name'] = df_agg['cpu_op_name'].astype(str) + '(' + df_agg['nn_module_parent'].astype(str)+')'
             cpu_op_map = {}
             for cpu_op in df_agg["cpu_op_name"].unique():
