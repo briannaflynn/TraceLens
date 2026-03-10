@@ -552,3 +552,103 @@ python tests/generate_synthetic_trace.py --multiplier 10 --output /tmp/synth_10x
 # Benchmark it
 python tests/benchmark_memory.py --trace /tmp/synth_10x.json.gz
 ```
+
+---
+
+## TraceDiff Pass 1 — Code Quality / Caching (2026-03-10)
+
+**Goal:** Remove duplicate imports, pre-compile regex patterns, and cache repeated
+`_normalize_name_for_comparison` calls to eliminate redundant regex work during
+tree comparison.
+
+**Input:** `tests/traces/h100/Qwen_Qwen1.5-0.5B-Chat__1016005.json.gz` vs
+           `tests/traces/mi300/Qwen_Qwen1.5-0.5B-Chat__1016005.json.gz`
+
+**Benchmark:** 10-run mean over full TraceDiff pipeline
+(`TraceDiff.__init__` → `generate_diff_stats` → `get_df_diff_stats_unique_args`
+→ `get_cpu_op_to_kernels_json`)
+
+**Baseline: 79 ms → After Pass 1: 21 ms (−73%, 3.8× faster)**
+
+---
+
+### Change A — Remove duplicate imports
+
+| | |
+|---|---|
+| **File** | `TraceLens/TraceDiff/trace_diff.py` |
+| **Lines (before)** | 7–16 |
+
+**Before:**
+```python
+import re
+from typing import Any, Callable, cast, Dict, Optional
+import pandas as pd
+import json
+import os
+import re      # duplicate
+import json    # duplicate
+import os      # duplicate
+import re      # triplicate
+```
+
+**After:**
+```python
+import functools
+import json
+import os
+import re
+from typing import Any, Callable, cast, Dict, Optional
+import pandas as pd
+```
+
+**Impact:** No runtime speedup; eliminates confusing dead code and import overhead.
+
+---
+
+### Change B — Pre-compile regex patterns + `@lru_cache` on `_normalize_name_for_comparison`
+
+| | |
+|---|---|
+| **File** | `TraceLens/TraceDiff/trace_diff.py` |
+| **Lines (after)** | 19–20 (module constants), 97–120 (method) |
+
+**Before:**
+```python
+@staticmethod
+def _normalize_name_for_comparison(name):
+    if name is None:
+        return name
+    normalized = re.sub(r"0x[0-9a-fA-F]+", "0xXXXX", name)
+    normalized = re.sub(r"\.py\(\d+\):", ".py:", normalized)
+    return normalized
+```
+
+**After:**
+```python
+_RE_HEX_ADDR = re.compile(r"0x[0-9a-fA-F]+")
+_RE_PY_LINENO = re.compile(r"\.py\(\d+\):")
+
+@staticmethod
+@functools.lru_cache(maxsize=4096)
+def _normalize_name_for_comparison(name):
+    if name is None:
+        return name
+    normalized = _RE_HEX_ADDR.sub("0xXXXX", name)
+    normalized = _RE_PY_LINENO.sub(".py:", normalized)
+    return normalized
+```
+
+**Why this is so effective:** `_normalize_name_for_comparison` is called once per
+node in both trees during `merge_trees`. Because traces are repetitive (the same
+kernel/op names appear thousands of times), the cache achieves a high hit rate.
+Pre-compiling the patterns avoids regex recompilation overhead on every call (even
+though Python caches compiled patterns internally, the `re.sub(pattern, ...)` API
+still incurs lookup overhead per call).
+
+**Measured impact:**
+| Metric | Before | After | Change |
+|---|---|---|---|
+| Mean wall-clock | 79 ms | 21 ms | **−73% (3.8×)** |
+| Min | — | 20.5 ms | — |
+| Max | — | 21.9 ms | — |
