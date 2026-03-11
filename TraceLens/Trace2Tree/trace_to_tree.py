@@ -127,7 +127,13 @@ class BaseTraceToTree(ABC):
         dict_pidtid2num_cpu_ops = defaultdict(int)
         dict_pidtid2nn_module_stack = defaultdict(list)
 
-        for event in events_sorted:
+        for event in tqdm(
+            events_sorted,
+            desc="    Call stack",
+            unit="event",
+            leave=False,
+            dynamic_ncols=True,
+        ):
             event["tree"] = True
             self.name2event_uids[
                 event[TraceLens.util.TraceEventUtils.TraceKeys.Name]
@@ -715,7 +721,13 @@ class TraceToTree:
         dict_pidtid2num_cpu_ops = defaultdict(int)
         dict_pidtid2nn_module_stack = defaultdict(list)
 
-        for event in events_sorted:
+        for event in tqdm(
+            events_sorted,
+            desc="    Call stack",
+            unit="event",
+            leave=False,
+            dynamic_ncols=True,
+        ):
             event["tree"] = True
             self.name2event_uids[
                 event[TraceLens.util.TraceEventUtils.TraceKeys.Name]

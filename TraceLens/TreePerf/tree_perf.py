@@ -180,8 +180,10 @@ class TreePerfAnalyzer:
     ) -> "TreePerfAnalyzer":
         # Creates a TreePerfAnalyzer from the trace in the provided filepath.
         # *args, **kwargs are passed to the TreePerfAnalyzer constructor.
+        tqdm.write("  [1/3] Loading and parsing trace file...")
         data = DataLoader.load_data(profile_filepath)
         data = data["traceEvents"]
+        tqdm.write(f"  [1/3] Done — {len(data):,} events loaded")
 
         categorizer = (
             TraceToTree.default_categorizer
@@ -189,8 +191,11 @@ class TreePerfAnalyzer:
             else TraceEventUtils.prepare_event_categorizer(data)
         )
         data = data if not jax else TraceEventUtils.non_metadata_events(data)
+        tqdm.write("  [2/3] Indexing events and linking CPU↔GPU...")
         tree = TraceToTree(data, event_to_category=categorizer)
+        tqdm.write("  [2/3] Done")
 
+        tqdm.write("  [3/3] Building call-stack tree...")
         return TreePerfAnalyzer(
             tree,
             jax=jax,
@@ -230,6 +235,7 @@ class TreePerfAnalyzer:
         )
         self.gpu_only = self.check_gpu_only()
         self.tree.build_tree(add_python_func=add_python_func)
+        tqdm.write("  [3/3] Done")
 
         # Apply pseudo-op extensions
         if enable_pseudo_ops:
