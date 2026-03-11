@@ -787,3 +787,113 @@ the first call. The benefit appears when comparing structurally different traces
 where many children lists have large M×N alignments to compute: numpy eliminates
 the `(M+1)×(N+1)` Python integer object allocations and uses contiguous int32
 memory instead.
+
+---
+
+## TraceDiff Pass 3 — O(K*N) scan elimination (2026-03-11)
+
+**Goal:** Replace repeated `df[df[col] == val].groupby()` loops with single
+multi-column groupby operations, reducing algorithmic complexity from O(K×N)
+to O(N log N) in `get_rename_map` and `get_cpu_op_to_kernels_json`.
+
+**Baseline cold run:** ~67 ms (lru_cache empty)
+**After Pass 3 cold run: ~18 ms (−73%)**
+**Warm run:** 18.8 ms → 18.1 ms (flat — pandas fixed overhead dominates)
+
+The cold run improvement proved the O(K×N) repeated DataFrame scanning was
+the actual cold-run bottleneck, not lru_cache misses as previously assumed.
+After this fix, warm and cold runs are indistinguishable (~18 ms).
+
+---
+
+### Change A — `get_rename_map`: single groupby replaces two O(K×N) scan loops
+
+| | |
+|---|---|
+| **File** | `TraceLens/TraceDiff/trace_diff.py` |
+| **Function** | `get_cpu_op_to_kernels_json` → `get_cpu_op_map` → `get_rename_map` |
+
+**Before:** Two separate O(K×N) patterns:
+```python
+# Pattern 1: O(unique_lca * N)
+result = {
+    str(lca_id): {
+        source: {...}
+        for source, group in df[df["lowest_common_ancestor_id"] == lca_id].groupby("source")
+    }
+    for lca_id in df["lowest_common_ancestor_id"].unique()
+}
+
+# Pattern 2: O(unique_cpu_op * N)
+for cpu_op in df["cpu_op_name"].unique():
+    for source, group in df[df["cpu_op_name"] == cpu_op].groupby("source"):
+        module_map[cpu_op] = ...
+```
+
+**After:** Two single O(N log N) groupby calls:
+```python
+result = {}
+for (lca_id, source), group in df.groupby(["lowest_common_ancestor_id", "source"], dropna=False):
+    result.setdefault(str(lca_id), {})[source] = {
+        "name": list(group["cpu_op_name"].unique()),
+        "nn_module_parent": list(group["nn_module_parent"].unique()),
+    }
+
+for (cpu_op, _source), group in df.groupby(["cpu_op_name", "source"], dropna=False):
+    module_map[cpu_op] = list(group["nn_module_parent"].unique())
+```
+
+---
+
+### Change B — `get_cpu_op_map`: single groupby replaces O(K×N) nested loop
+
+**Before:**
+```python
+for cpu_op in df_agg["cpu_op_name"].unique():
+    for source, group in df_agg[df_agg["cpu_op_name"] == cpu_op].groupby("source"):
+        cpu_op_map[cpu_op][source] = {"kernels": ..., "nn_module_parents": ...}
+```
+
+**After:**
+```python
+for (cpu_op, source), group in df_agg.groupby(["cpu_op_name", "source"], dropna=False):
+    cpu_op_map.setdefault(cpu_op, {})[source] = {
+        "kernels": sorted(list(group["name"].unique())),
+        "nn_module_parents": sorted(list(group["nn_module_parent"].unique())),
+    }
+```
+
+---
+
+### Change C — `result` kernel→cpu_op dict: single groupby replaces dict comprehension
+
+**Before:**
+```python
+result = {
+    kernel_name: {
+        source: {"cpu_op_name": list(group["cpu_op_name"].unique())}
+        for source, group in df_agg[df_agg["name"] == kernel_name].groupby("source")
+    }
+    for kernel_name in df_agg["name"].unique()
+}
+```
+
+**After:**
+```python
+result = {}
+for (kernel_name, source), group in df_agg.groupby(["name", "source"], dropna=False):
+    result.setdefault(kernel_name, {})[source] = {
+        "cpu_op_name": list(group["cpu_op_name"].unique()),
+    }
+```
+
+---
+
+**Cumulative TraceDiff results:**
+
+| Pass | Cold run | Warm run | vs original (79 ms warm) |
+|---|---|---|---|
+| Baseline | ~79 ms | 79 ms | — |
+| Pass 1 (lru_cache + regex) | ~67 ms | 21 ms | warm −73% |
+| Pass 2 (pandas efficiency) | ~67 ms | 18.8 ms | warm −76% |
+| Pass 3 (O(K×N) → O(N log N)) | **~18 ms** | 18.1 ms | **cold −77%, warm −77%** |

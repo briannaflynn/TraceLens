@@ -1312,27 +1312,21 @@ class TraceDiff:
                 return None
 
             def get_rename_map(df):
-                result = {
-                    str(lca_id): {
-                        source: {
-                            "name": list(group["cpu_op_name"].unique()),
-                            "nn_module_parent": list(
-                                group["nn_module_parent"].unique()
-                            ),
-                        }
-                        for source, group in df[
-                            df["lowest_common_ancestor_id"] == lca_id
-                        ].groupby("source")
+                # Single groupby replaces O(K*N) repeated filter+groupby scans
+                result = {}
+                for (lca_id, source), group in df.groupby(
+                    ["lowest_common_ancestor_id", "source"], dropna=False
+                ):
+                    result.setdefault(str(lca_id), {})[source] = {
+                        "name": list(group["cpu_op_name"].unique()),
+                        "nn_module_parent": list(group["nn_module_parent"].unique()),
                     }
-                    for lca_id in df["lowest_common_ancestor_id"].unique()
-                }
 
                 module_map = {}
-                for cpu_op in df["cpu_op_name"].unique():
-                    for source, group in df[df["cpu_op_name"] == cpu_op].groupby(
-                        "source"
-                    ):
-                        module_map[cpu_op] = list(group["nn_module_parent"].unique())
+                for (cpu_op, _source), group in df.groupby(
+                    ["cpu_op_name", "source"], dropna=False
+                ):
+                    module_map[cpu_op] = list(group["nn_module_parent"].unique())
                 visited_cpu_op = []
                 rename_map = {}
                 ##
@@ -1398,29 +1392,21 @@ class TraceDiff:
             df_agg["nn_module_parent"] = df_agg["nn_module_parent"].str.replace(" ", "", regex=False)
             ##df_agg['cpu_op_name'] = df_agg['cpu_op_name'].astype(str) + '(' + df_agg['nn_module_parent'].astype(str)+')'
             cpu_op_map = {}
-            for cpu_op in df_agg["cpu_op_name"].unique():
-                cpu_op_map[cpu_op] = {}
-                for source, group in df_agg[df_agg["cpu_op_name"] == cpu_op].groupby(
-                    "source"
-                ):
-                    cpu_op_map[cpu_op][source] = {
-                        "kernels": sorted(list(group["name"].unique()))
-                    }
-                    cpu_op_map[cpu_op][source]["nn_module_parents"] = sorted(
-                        list(group["nn_module_parent"].unique())
-                    )
-
-            result = {
-                kernel_name: {
-                    source: {
-                        "cpu_op_name": list(group["cpu_op_name"].unique()),
-                    }
-                    for source, group in df_agg[df_agg["name"] == kernel_name].groupby(
-                        "source"
-                    )
+            for (cpu_op, source), group in df_agg.groupby(
+                ["cpu_op_name", "source"], dropna=False
+            ):
+                cpu_op_map.setdefault(cpu_op, {})[source] = {
+                    "kernels": sorted(list(group["name"].unique())),
+                    "nn_module_parents": sorted(list(group["nn_module_parent"].unique())),
                 }
-                for kernel_name in df_agg["name"].unique()
-            }
+
+            result = {}
+            for (kernel_name, source), group in df_agg.groupby(
+                ["name", "source"], dropna=False
+            ):
+                result.setdefault(kernel_name, {})[source] = {
+                    "cpu_op_name": list(group["cpu_op_name"].unique()),
+                }
             print("Kernel to CPU op mapping (showing entries with 1:n mapping):")
             for name, mapping in result.items():
                 if len(mapping.get("trace1", {}).get("cpu_op_name", [])) > 1:
