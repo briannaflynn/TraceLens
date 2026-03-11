@@ -897,3 +897,63 @@ for (kernel_name, source), group in df_agg.groupby(["name", "source"], dropna=Fa
 | Pass 1 (lru_cache + regex) | ~67 ms | 21 ms | warm −73% |
 | Pass 2 (pandas efficiency) | ~67 ms | 18.8 ms | warm −76% |
 | Pass 3 (O(K×N) → O(N log N)) | **~18 ms** | 18.1 ms | **cold −77%, warm −77%** |
+
+---
+
+## Pass 5 — Parallel call-stack building (2026-03-11)
+
+**Goal:** Speed up `build_host_call_stack_tree` for multi-threaded traces by
+processing each (pid, tid) thread independently and in parallel.
+
+**File:** `TraceLens/Trace2Tree/trace_to_tree.py`
+
+**Algorithm change:**
+
+The old serial loop iterated over ALL filtered events in global timestamp order,
+dispatching to per-(pid,tid) stacks via `dict_pidtid2stack`.  Since different
+threads' stacks are completely independent (no cross-thread parent/child
+relationships), each thread is a naturally parallel work unit.
+
+**New architecture:**
+
+1. **Phase 1 (serial):** Filter events, group UIDs by `(pid, tid)`, sort each
+   group individually by timestamp → `K` sorted UID lists.
+2. **Phase 2 (parallel):** Fork a `Pool(min(K, cpu_count))` and dispatch each
+   group to `_cs_process_group`.  Workers read events via fork-inherited
+   module-global `_CS_EVENTS_BY_UID` (zero pickling of large event dicts).
+   Each worker returns compact mutation dicts (`patches`, `children_to_add`,
+   `cpu_root_uids`, `name_to_uids`).
+3. **Phase 3 (serial):** Apply all mutations to `self.events_by_uid`, sort
+   `cpu_root_nodes` by timestamp to restore global ordering.
+
+**Serial fallback:** When `K ≤ 1` (single-thread trace like Qwen), the same
+`_cs_process_group` function is called directly with a tqdm-wrapped UID list for
+event-level progress — no code duplication.
+
+**Key code additions:**
+
+```python
+# Module-level globals — set before fork, inherited copy-on-write
+_CS_EVENTS_BY_UID: dict = {}
+_CS_STRIP_NN_SUFFIX: bool = False
+
+def _cs_process_group(uid_list) -> tuple:
+    # reads _CS_EVENTS_BY_UID; returns (patches, children_to_add,
+    #                                    cpu_root_uids, name_to_uids)
+    ...
+
+# In TraceToTree.build_host_call_stack_tree:
+if n_groups > 1:
+    ctx = _multiprocessing.get_context("fork")
+    with ctx.Pool(n_workers) as pool:
+        results = list(tqdm(pool.imap(_cs_process_group, sorted_groups), ...))
+    # merge results ...
+```
+
+**Expected speedup:** Proportional to number of (pid,tid) threads.
+- Single-thread traces (Qwen): ~0% (serial path, same cost as before)
+- Multi-GPU training traces (llama_70b_fsdp, 8-GPU): up to `K×` where K is
+  the number of distinct CPU threads captured in the trace.
+
+**Validation:** `python -m pytest tests/test_perf_report_regression.py -v`
+Result: **13/13 passed**

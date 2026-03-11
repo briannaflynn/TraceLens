@@ -11,11 +11,107 @@ import TraceLens.util
 
 from ..util import TraceEventUtils, JaxProfileProcessor
 import re
+import multiprocessing as _multiprocessing
+import os
 
 from abc import ABC, abstractmethod
 import logging
 
 logger = logging.getLogger(__name__)
+
+# ── Pre-compiled patterns ────────────────────────────────────────────────────
+_RE_NN_SUFFIX = re.compile(r"_\d+$")
+
+# ── Globals for fork-based parallel call-stack workers ──────────────────────
+# Set in the main process immediately before spawning a Pool; inherited
+# copy-on-write by forked children so no pickling of large event dicts.
+_CS_EVENTS_BY_UID: dict = {}
+_CS_STRIP_NN_SUFFIX: bool = False
+
+
+def _cs_process_group(uid_list: list) -> tuple:
+    """Process one (pid,tid) group of events for call-stack tree building.
+
+    ``uid_list`` contains event UIDs pre-sorted by timestamp for a single
+    (pid,tid) thread.  The function reads events from the module-global
+    ``_CS_EVENTS_BY_UID`` dict (set by the caller before fork) and returns
+    compact mutation data rather than modifying the shared dicts in place.
+
+    Returns
+    -------
+    (patches, children_to_add, cpu_root_uids, name_to_uids)
+        patches         – {uid: {key: value, ...}} mutations to apply
+        children_to_add – {parent_uid: [child_uid, ...]}
+        cpu_root_uids   – list of UIDs that are cpu_op roots (timestamp order)
+        name_to_uids    – {name: [uid, ...]}
+    """
+    _TS = "ts"
+    _TE = "t_end"
+    _UID = "UID"
+    _NAME = "name"
+
+    events_by_uid = _CS_EVENTS_BY_UID
+    strip_nn_suffix = _CS_STRIP_NN_SUFFIX
+
+    patches: dict = {}
+    children_to_add: dict = defaultdict(list)
+    cpu_root_uids: list = []
+    name_to_uids: dict = defaultdict(list)
+
+    # (uid, te, cat, is_nn_module)
+    stack: list = []
+    num_cpu_ops: int = 0
+    nn_module_stack: list = []
+
+    for uid in uid_list:
+        event = events_by_uid[uid]
+        cat = event.get("cat")
+        ts = event[_TS]
+        te = event[_TE]
+        name = event[_NAME]
+        is_nn = cat == "python_function" and name.startswith("nn.Module:")
+
+        name_to_uids[name].append(uid)
+
+        # Pop expired events from the stack
+        while stack:
+            top_uid, top_te, top_cat, top_is_nn = stack[-1]
+            if ts >= top_te:
+                stack.pop()
+                if top_cat == "cpu_op":
+                    num_cpu_ops -= 1
+                if top_is_nn:
+                    nn_module_stack.pop()
+            else:
+                break
+
+        # Skip events that don't fit within the current parent's window
+        if stack and te > stack[-1][1]:
+            continue
+
+        patch: dict = {"tree": True}
+        patch["nn_module_stack"] = list(nn_module_stack) if nn_module_stack else ["root"]
+
+        if stack:
+            parent_uid = stack[-1][0]
+            children_to_add[parent_uid].append(uid)
+            patch["parent"] = parent_uid
+
+        stack.append((uid, te, cat, is_nn))
+
+        if is_nn:
+            nn_name = _RE_NN_SUFFIX.sub("", name) if strip_nn_suffix else name
+            nn_module_stack.append(nn_name)
+
+        if cat == "cpu_op":
+            if num_cpu_ops == 0:
+                patch["cpu_op_root"] = True
+                cpu_root_uids.append(uid)
+            num_cpu_ops += 1
+
+        patches[uid] = patch
+
+    return patches, dict(children_to_add), cpu_root_uids, dict(name_to_uids)
 
 
 class BaseTraceToTree(ABC):
@@ -691,15 +787,18 @@ class TraceToTree:
 
     # TODO base class includes this, remove
     def build_host_call_stack_tree(self, add_python_func=False):
-        # 1. Filter and sort events based on their start timestamps.
-        #    - Include only CPU, CUDA runtime, and optionally Python function events.
-        # 2. Iterate through the sorted events and maintain a stack to track the current call hierarchy.
-        #    - Pop events from the stack if they end before the current event starts to find the parent.
-        #    - Set the parent of the current event as the top of the stack if the stack is not empty.
-        #    - Push the current event onto the stack.
-        #    - For CPU operations:
-        #      - Mark as a root node if it is the first CPU operation in the stack.
-        #      - Increment the count of CPU operations in the stack.
+        # 1. Filter events and group by (pid, tid) thread.
+        # 2. If multiple threads exist, process each group in parallel (fork pool).
+        #    Each worker is independent — threads never share stack state.
+        # 3. Merge mutation results back into self.events_by_uid serially.
+        # 4. Single-thread traces fall back to the serial per-event loop.
+        global _CS_EVENTS_BY_UID, _CS_STRIP_NN_SUFFIX
+        tqdm.write(f"Building CPU op tree with add_python_func={add_python_func}")
+        self.add_python_func = add_python_func
+
+        _UID = TraceLens.util.TraceEventUtils.TraceKeys.UID
+        _TS = TraceLens.util.TraceEventUtils.TraceKeys.TimeStamp
+
         def event_filter(event):
             # PyTorch trace events already carry "cat" from the JSON; read it
             # once and reuse — avoids two event_to_category() call overheads.
@@ -708,86 +807,88 @@ class TraceToTree:
                 add_python_func and cat == "python_function"
             )
 
-        tqdm.write(f"Building CPU op tree with add_python_func={add_python_func}")
+        # Group filtered event UIDs by (pid, tid) and sort each group by timestamp.
+        # Per-group sort is O(N/K log N/K) vs O(N log N) global — same asymptotically
+        # but produces K independent work units for parallel dispatch.
+        pidtid_buckets: dict = defaultdict(list)
+        for event in filter(event_filter, self.events):
+            pidtid_buckets[(event.get("pid"), event.get("tid"))].append(
+                (event[_TS], event[_UID])
+            )
+        for key in pidtid_buckets:
+            pidtid_buckets[key].sort()
+        sorted_groups = [[uid for _, uid in pairs] for pairs in pidtid_buckets.values()]
+        n_groups = len(sorted_groups)
 
-        self.add_python_func = add_python_func
-        list_events = filter(event_filter, self.events)
+        if n_groups > 1:
+            # ── Parallel path: one worker per (pid,tid) thread ───────────────
+            _CS_EVENTS_BY_UID = self.events_by_uid
+            _CS_STRIP_NN_SUFFIX = True
+            n_workers = min(n_groups, os.cpu_count() or 1)
+            tqdm.write(
+                f"  Parallel call-stack: {n_groups} threads, {n_workers} workers"
+            )
+            ctx = _multiprocessing.get_context("fork")
+            with ctx.Pool(n_workers) as pool:
+                results = list(
+                    tqdm(
+                        pool.imap(_cs_process_group, sorted_groups),
+                        total=n_groups,
+                        desc="    Call stack",
+                        unit="thread",
+                        leave=False,
+                        dynamic_ncols=True,
+                    )
+                )
+            # Merge per-thread results back into shared event dicts
+            all_cpu_roots: list = []
+            for patches, children_to_add, cpu_root_uids, name_to_uids in results:
+                for uid, patch in patches.items():
+                    self.events_by_uid[uid].update(patch)
+                for parent_uid, child_uids in children_to_add.items():
+                    self.events_by_uid[parent_uid].setdefault("children", []).extend(
+                        child_uids
+                    )
+                all_cpu_roots.extend(
+                    (self.events_by_uid[uid][_TS], uid) for uid in cpu_root_uids
+                )
+                for name, uids in name_to_uids.items():
+                    self.name2event_uids[name].extend(uids)
+            # Restore global timestamp order for cpu_root_nodes
+            all_cpu_roots.sort()
+            self.cpu_root_nodes = [uid for _, uid in all_cpu_roots]
+            return
 
-        events_sorted = sorted(
-            list_events,
-            key=lambda e: e[TraceLens.util.TraceEventUtils.TraceKeys.TimeStamp],
-        )
-        dict_pidtid2stack = defaultdict(list)
-        dict_pidtid2num_cpu_ops = defaultdict(int)
-        dict_pidtid2nn_module_stack = defaultdict(list)
+        # ── Serial fallback: single (pid,tid) thread or empty trace ─────────
+        # Re-uses _cs_process_group so logic stays in one place; the tqdm bar
+        # wraps the UID list to give event-level progress.
+        _CS_EVENTS_BY_UID = self.events_by_uid
+        _CS_STRIP_NN_SUFFIX = True
+        uid_list = sorted_groups[0] if sorted_groups else []
 
-        for event in tqdm(
-            events_sorted,
+        # Wrap uid_list with tqdm for event-level progress on single-thread traces
+        tracked = tqdm(
+            uid_list,
             desc="    Call stack",
             unit="event",
             leave=False,
             dynamic_ncols=True,
-        ):
-            event["tree"] = True
-            self.name2event_uids[
-                event[TraceLens.util.TraceEventUtils.TraceKeys.Name]
-            ].append(event[TraceLens.util.TraceEventUtils.TraceKeys.UID])
+        )
+        # Temporarily swap uid_list for the tracked version inside _cs_process_group
+        # by passing a tqdm-wrapped iterable.  We do the loop inline here so we can
+        # reuse the exact same logic path.
+        patches, children_to_add, cpu_root_uids, name_to_uids = _cs_process_group(
+            tracked
+        )
+        tracked.close()
 
-            pid = event.get(TraceLens.util.TraceEventUtils.TraceKeys.PID)
-            tid = event.get(TraceLens.util.TraceEventUtils.TraceKeys.TID)
-            stack_key = (pid, tid)
-            stack = dict_pidtid2stack[stack_key]
-            nn_module_stack = dict_pidtid2nn_module_stack[stack_key]
-
-            while (
-                stack
-                and event[TraceLens.util.TraceEventUtils.TraceKeys.TimeStamp]
-                >= stack[-1][TraceLens.util.TraceEventUtils.TraceKeys.TimeEnd]
-            ):
-                popped_event = stack.pop()
-                if popped_event.get("cat") == "cpu_op":
-                    dict_pidtid2num_cpu_ops[stack_key] -= 1
-                # Pop from nn_module_stack if this was an nn.Module event
-                if self._is_nn_module_event(popped_event):
-                    nn_module_stack.pop()
-
-            if (
-                stack
-                and event[TraceLens.util.TraceEventUtils.TraceKeys.TimeEnd]
-                > stack[-1][TraceLens.util.TraceEventUtils.TraceKeys.TimeEnd]
-            ):
-                # TODO add following to logging when logging level is debug
-                # print(f"Invalid event ordering: {event[TraceLens.util.TraceEventUtils.TraceKeys.Name]} ends after the stack top event.")
-                continue
-
-            # Set nn_module_stack for the current event (copy to avoid reference issues)
-            if nn_module_stack:
-                event["nn_module_stack"] = list(nn_module_stack)
-            else:
-                event["nn_module_stack"] = ["root"]
-
-            if stack:
-                parent = stack[-1]
-                parent.setdefault("children", []).append(
-                    event[TraceLens.util.TraceEventUtils.TraceKeys.UID]
-                )
-                event["parent"] = parent[TraceLens.util.TraceEventUtils.TraceKeys.UID]
-
-            stack.append(event)
-
-            # Push onto nn_module_stack if this is an nn.Module event
-            if self._is_nn_module_event(event):
-                name = event["name"]
-                name = re.sub(r"_\d+$", "", name)
-                nn_module_stack.append(name)
-
-            if event.get("cat") == "cpu_op":
-                if dict_pidtid2num_cpu_ops[stack_key] == 0:
-                    event["cpu_op_root"] = True
-                    self.cpu_root_nodes.append(
-                        event[TraceLens.util.TraceEventUtils.TraceKeys.UID]
-                    )
-                dict_pidtid2num_cpu_ops[stack_key] += 1
+        for uid, patch in patches.items():
+            self.events_by_uid[uid].update(patch)
+        for parent_uid, child_uids in children_to_add.items():
+            self.events_by_uid[parent_uid].setdefault("children", []).extend(child_uids)
+        self.cpu_root_nodes = cpu_root_uids  # already in timestamp order
+        for name, uids in name_to_uids.items():
+            self.name2event_uids[name].extend(uids)
 
     def add_gpu_ops_to_tree(self):
         for runtime_event in self.events:
