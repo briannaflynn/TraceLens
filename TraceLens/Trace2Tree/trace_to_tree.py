@@ -819,29 +819,36 @@ class TraceToTree:
         n_groups = len(sorted_groups)
 
         if n_groups > 1:
-            # ── Parallel path: one worker per (pid,tid) thread ───────────────
-            # Each worker receives only its own group's events as a compact dict
-            # (ts, t_end, name, cat only).  This avoids the CPython refcount
-            # CoW problem: forked workers touching a shared events_by_uid dict
-            # dirty every page they read, causing full physical copies of the
-            # entire event set per worker (observed: 10 workers × 26 GB = 260 GB
-            # RSS on a 10M-event trace).  With spawn + pre-partitioned compact
-            # dicts, each worker receives only ~N/K events via pickle.
-            n_workers = min(n_groups, os.cpu_count() or 1)
+            # ── Parallel path: batched spawn workers ─────────────────────────
+            # Each worker receives a compact event dict (ts, t_end, name, cat
+            # only) for its own group.  Workers run in batches of n_workers so
+            # at most n_workers compact dicts + result sets are live at once.
+            #
+            # Why batched rather than a single Pool.imap over all groups:
+            # pool.imap eagerly submits all tasks when workers are free, so with
+            # n_groups == n_workers all compact dicts are built and held in
+            # memory simultaneously.  Explicit batching bounds peak memory to
+            # n_workers × per-group overhead regardless of n_groups.
+            #
+            # n_workers default = 2: empirically each spawn worker holds ~20 GB
+            # for a 10M-event trace (compact events + patches + name_to_uids);
+            # running 10 concurrently caused ~230 GB RSS + heavy swap.  Two
+            # workers keep total RSS to ~main + 40 GB on the same trace.
+            n_workers = min(n_groups, 2)
+
+            # Log group sizes so skewed distributions are visible.
+            group_sizes = [len(g) for g in sorted_groups]
             tqdm.write(
-                f"  Parallel call-stack: {n_groups} threads, {n_workers} workers"
+                f"  Parallel call-stack: {n_groups} groups, {n_workers} workers, "
+                f"group sizes: {sorted(group_sizes, reverse=True)}"
             )
 
             _full = self.events_by_uid
 
-            def _group_args():
-                """Yield (uid_list, compact_events) one group at a time.
-
-                Building compact dicts lazily keeps peak memory proportional to
-                one group rather than all groups simultaneously.
-                """
-                for uid_list in sorted_groups:
-                    compact = {
+            def _build_compact(uid_list):
+                return (
+                    uid_list,
+                    {
                         uid: {
                             "ts": ev["ts"],
                             "t_end": ev["t_end"],
@@ -850,35 +857,32 @@ class TraceToTree:
                         }
                         for uid in uid_list
                         for ev in (_full[uid],)
-                    }
-                    yield (uid_list, compact)
+                    },
+                )
 
-            ctx = _multiprocessing.get_context("spawn")
-            with ctx.Pool(n_workers) as pool:
-                results = list(
-                    tqdm(
-                        pool.imap(_cs_process_group, _group_args()),
-                        total=n_groups,
-                        desc="    Call stack",
-                        unit="thread",
-                        leave=False,
-                        dynamic_ncols=True,
-                    )
-                )
-            # Merge per-thread results back into shared event dicts
             all_cpu_roots: list = []
-            for patches, children_to_add, cpu_root_uids, name_to_uids in results:
-                for uid, patch in patches.items():
-                    self.events_by_uid[uid].update(patch)
-                for parent_uid, child_uids in children_to_add.items():
-                    self.events_by_uid[parent_uid].setdefault("children", []).extend(
-                        child_uids
-                    )
-                all_cpu_roots.extend(
-                    (self.events_by_uid[uid][_TS], uid) for uid in cpu_root_uids
-                )
-                for name, uids in name_to_uids.items():
-                    self.name2event_uids[name].extend(uids)
+            ctx = _multiprocessing.get_context("spawn")
+            completed = 0
+            with tqdm(total=n_groups, desc="    Call stack", unit="group", leave=False, dynamic_ncols=True) as pbar:
+                for batch_start in range(0, n_groups, n_workers):
+                    batch = sorted_groups[batch_start : batch_start + n_workers]
+                    batch_args = [_build_compact(uid_list) for uid_list in batch]
+                    with ctx.Pool(len(batch)) as pool:
+                        batch_results = pool.map(_cs_process_group, batch_args)
+                    for patches, children_to_add, cpu_root_uids, name_to_uids in batch_results:
+                        for uid, patch in patches.items():
+                            self.events_by_uid[uid].update(patch)
+                        for parent_uid, child_uids in children_to_add.items():
+                            self.events_by_uid[parent_uid].setdefault("children", []).extend(
+                                child_uids
+                            )
+                        all_cpu_roots.extend(
+                            (self.events_by_uid[uid][_TS], uid) for uid in cpu_root_uids
+                        )
+                        for name, uids in name_to_uids.items():
+                            self.name2event_uids[name].extend(uids)
+                    pbar.update(len(batch))
+
             # Restore global timestamp order for cpu_root_nodes
             all_cpu_roots.sort()
             self.cpu_root_nodes = [uid for _, uid in all_cpu_roots]
