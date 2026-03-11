@@ -10,6 +10,7 @@ import os
 import re
 from typing import Any, Callable, cast, Dict, Optional
 
+import numpy as np
 import pandas as pd
 
 import TraceLens.util
@@ -272,18 +273,16 @@ class TraceDiff:
 
         m, n = len(items1), len(items2)
 
-        dp = [[0] * (n + 1) for _ in range(m + 1)]
-        for i in range(m + 1):
-            dp[i][0] = i
-        for j in range(n + 1):
-            dp[0][j] = j
+        dp = np.empty((m + 1, n + 1), dtype=np.int32)
+        dp[:, 0] = np.arange(m + 1)
+        dp[0, :] = np.arange(n + 1)
         for i in range(1, m + 1):
             for j in range(1, n + 1):
                 cost = 0 if names1[i - 1] == names2[j - 1] else 1
-                dp[i][j] = min(
-                    dp[i - 1][j] + 1,
-                    dp[i][j - 1] + 1,
-                    dp[i - 1][j - 1] + cost,
+                dp[i, j] = min(
+                    dp[i - 1, j] + 1,
+                    dp[i, j - 1] + 1,
+                    dp[i - 1, j - 1] + cost,
                 )
         # Backtrack
         i, j = m, n
@@ -293,7 +292,7 @@ class TraceDiff:
                 ops.append(("match", i - 1, j - 1))
                 i -= 1
                 j -= 1
-            elif i > 0 and (j == 0 or dp[i][j] == dp[i - 1][j] + 1):
+            elif i > 0 and (j == 0 or dp[i, j] == dp[i - 1, j] + 1):
                 ops.append(("delete", i - 1, None))
                 i -= 1
             else:

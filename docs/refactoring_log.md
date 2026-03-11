@@ -753,3 +753,37 @@ per row. `str.replace` similarly runs in vectorized C code.
 |---|---|---|
 | Pass 1 (lru_cache + regex) | 21 ms | −73% (3.8×) |
 | Pass 2 (pandas efficiency) | 18.8 ms | **−76% (4.2×)** |
+
+---
+
+## TraceDiff Pass 2b — Wagner-Fischer numpy DP matrix (2026-03-11)
+
+**Goal:** Replace the O(M×N) Python list-of-lists DP matrix in `wagner_fischer`
+with a contiguous numpy int32 array, eliminating per-cell Python object overhead.
+
+**File:** `TraceLens/TraceDiff/trace_diff.py` — `wagner_fischer` (line ~275)
+
+**Before:**
+```python
+dp = [[0] * (n + 1) for _ in range(m + 1)]
+for i in range(m + 1):
+    dp[i][0] = i
+for j in range(n + 1):
+    dp[0][j] = j
+```
+
+**After:**
+```python
+dp = np.empty((m + 1, n + 1), dtype=np.int32)
+dp[:, 0] = np.arange(m + 1)
+dp[0, :] = np.arange(n + 1)
+```
+
+Inner loop and backtrack updated to numpy indexing (`dp[i, j]` vs `dp[i][j]`).
+
+**Measured on Qwen h100 vs mi300:** No change (18.8 ms) — these traces are nearly
+identical so the DP matrix is always small and the cache (`wf_cache`) is hit after
+the first call. The benefit appears when comparing structurally different traces
+where many children lists have large M×N alignments to compute: numpy eliminates
+the `(M+1)×(N+1)` Python integer object allocations and uses contiguous int32
+memory instead.
