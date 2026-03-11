@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -804,11 +805,18 @@ class TreePerfAnalyzer:
                 _ctx = multiprocessing.get_context("fork")
                 _chunksize = max(1, n // ((os.cpu_count() or 4) * 4))
                 with _ctx.Pool() as _pool:
-                    _results = _pool.map(
-                        _compute_launcher_metrics_fork,
-                        sorted_launcher_uids,
-                        chunksize=_chunksize,
-                    )
+                    _results = list(tqdm(
+                        _pool.imap(
+                            _compute_launcher_metrics_fork,
+                            sorted_launcher_uids,
+                            chunksize=_chunksize,
+                        ),
+                        total=n,
+                        desc="  Launcher metrics",
+                        unit="launcher",
+                        leave=False,
+                        dynamic_ncols=True,
+                    ))
             finally:
                 _FORK_ANALYZER = None
                 _FORK_LAUNCHER_KERNELS = None
@@ -817,7 +825,13 @@ class TreePerfAnalyzer:
         else:
             direct_times = []
             subtree_times = []
-            for launcher_uid in sorted_launcher_uids:
+            for launcher_uid in tqdm(
+                sorted_launcher_uids,
+                desc="  Launcher metrics",
+                unit="launcher",
+                leave=False,
+                dynamic_ncols=True,
+            ):
                 kernels = launcher_to_kernels[launcher_uid]
                 event = self.tree.get_UID2event(launcher_uid)
                 direct_times.append(

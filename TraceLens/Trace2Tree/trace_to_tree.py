@@ -6,6 +6,7 @@
 
 from collections import defaultdict
 from typing import Dict, Any, Callable
+from tqdm import tqdm
 import TraceLens.util
 
 from ..util import TraceEventUtils, JaxProfileProcessor
@@ -113,7 +114,7 @@ class BaseTraceToTree(ABC):
                 add_python_func and cat == "python_function"
             )
 
-        print(f"Building CPU op tree with add_python_func={add_python_func}")
+        tqdm.write(f"Building CPU op tree with add_python_func={add_python_func}")
 
         self.add_python_func = add_python_func
         list_events = filter(event_filter, self.events)
@@ -402,7 +403,7 @@ class JaxTraceToTree(BaseTraceToTree):
         self._set_hlo_ops(pb_file_name)
         self._create_linking_key_to_uid_map()
         self._link_cpu_gpu()
-        print(f"Building tree with add_python_func={add_python_func}")
+        tqdm.write(f"Building tree with add_python_func={add_python_func}")
         self.build_host_call_stack_tree(add_python_func)
         self.add_gpu_ops_to_tree()
         if self.prune_nongpu_paths:
@@ -701,7 +702,7 @@ class TraceToTree:
                 add_python_func and cat == "python_function"
             )
 
-        print(f"Building CPU op tree with add_python_func={add_python_func}")
+        tqdm.write(f"Building CPU op tree with add_python_func={add_python_func}")
 
         self.add_python_func = add_python_func
         list_events = filter(event_filter, self.events)
@@ -825,7 +826,7 @@ class TraceToTree:
                 event["non_gpu_path"] = True
 
     def build_tree(self, add_python_func=False, link_fwd_bwd=True) -> None:
-        print(f"Building tree with add_python_func={add_python_func}")
+        tqdm.write(f"Building tree with add_python_func={add_python_func}")
         self.build_host_call_stack_tree(add_python_func)
         self.add_gpu_ops_to_tree()
 

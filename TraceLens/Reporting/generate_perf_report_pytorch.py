@@ -15,6 +15,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from TraceLens import NcclAnalyser, TraceToTree, TreePerfAnalyzer
 from TraceLens.Reporting.reporting_utils import request_install
@@ -258,6 +259,18 @@ def generate_perf_report_pytorch(
     else:
         gpu_arch_json = None
 
+    stages = [
+        "Load & build tree",
+        "GPU timeline",
+        "Kernel launchers",
+        "Launcher summaries",
+        "Per-op perf metrics",
+        "Unified perf table",
+        "Collective analysis",
+        "Write output",
+    ]
+    progress = tqdm(total=len(stages), desc=stages[0], unit="stage", dynamic_ncols=True)
+
     perf_analyzer = TreePerfAnalyzer.from_file(
         profile_filepath=profile_json_path,
         arch=gpu_arch_json,
@@ -277,13 +290,15 @@ def generate_perf_report_pytorch(
 
     # Detect GPU-only trace early and inform user
     if perf_analyzer.gpu_only:
-        print(
+        tqdm.write(
             "Detected GPU-only trace. Skipping CPU-dependent analysis and generating only GPU timeline and kernel summary."
         )
 
     agg_metrics = ["mean", "median", "std", "min", "max"]
 
     # Generate base DataFrames
+    progress.update(1)
+    progress.set_description(stages[1])
     df_gpu_timeline = perf_analyzer.get_df_gpu_timeline(
         micro_idle_thresh_us=micro_idle_thresh_us
     )
@@ -302,11 +317,15 @@ def generate_perf_report_pytorch(
     df_short_kernels = pd.DataFrame()
 
     # Only process CPU-dependent analysis for non-GPU-only traces
+    progress.update(1)
+    progress.set_description(stages[2])
     if not perf_analyzer.gpu_only:
         df_kernel_launchers = perf_analyzer.get_df_kernel_launchers(
             include_kernel_details=True,
             include_first_occurrence_time=include_first_occurrence_time,
         )
+        progress.update(1)
+        progress.set_description(stages[3])
         df_kernel_launchers_summary = perf_analyzer.get_df_kernel_launchers_summary(
             df_kernel_launchers
         )
@@ -328,7 +347,15 @@ def generate_perf_report_pytorch(
         # Dictionary to hold the op-specific DataFrames
         perf_metrics_dfs = {}
 
-        for op_cat, op_names in perf_analyzer.dict_cat2names.items():
+        progress.update(1)
+        progress.set_description(stages[4])
+        for op_cat, op_names in tqdm(
+            perf_analyzer.dict_cat2names.items(),
+            desc="  Op categories",
+            unit="cat",
+            leave=False,
+            dynamic_ncols=True,
+        ):
             # Filter events belonging to the current category
             op_events = [
                 event
@@ -443,6 +470,8 @@ def generate_perf_report_pytorch(
             dict_name2df["ops_unique_args"] = df_kernel_launchers_unique_args
 
         # Add unified perf metrics table (ops with perf models + leaf ops with GPU kernels)
+        progress.update(1)
+        progress.set_description(stages[5])
         df_unified_perf = perf_analyzer.build_df_unified_perf_table()
         if not df_unified_perf.empty:
             df_unified_perf_summary = perf_analyzer.summarize_df_unified_perf_table(
@@ -556,6 +585,8 @@ def generate_perf_report_pytorch(
         dict_name2df["short_kernels_summary"] = df_short_kernels
 
     # Skip collective analysis for GPU-only traces (no CPU ops means no collectives)
+    progress.update(1)
+    progress.set_description(stages[6])
     if collective_analysis and not perf_analyzer.gpu_only:
         nccl_analyser = NcclAnalyser([profile_json_path], None)
         df_nccl_summary = nccl_analyser.build_df_summary_long()
@@ -581,6 +612,8 @@ def generate_perf_report_pytorch(
                 print(f"Added {len(additional_dfs)} additional sheets from extension")
 
     # Write all DataFrames to separate sheets in an Excel workbook
+    progress.update(1)
+    progress.set_description(stages[7])
     if output_csvs_dir:
         # Ensure the output directory exists
         os.makedirs(output_csvs_dir, exist_ok=True)
@@ -602,8 +635,10 @@ def generate_perf_report_pytorch(
         with pd.ExcelWriter(output_xlsx_path, engine="openpyxl") as writer:
             for sheet_name, df in dict_name2df.items():
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
-            print(f"DataFrames successfully written to {output_xlsx_path}")
+            tqdm.write(f"DataFrames successfully written to {output_xlsx_path}")
 
+    progress.update(1)
+    progress.close()
     return dict_name2df
 
 
