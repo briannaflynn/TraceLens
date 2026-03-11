@@ -22,20 +22,19 @@ logger = logging.getLogger(__name__)
 # ── Pre-compiled patterns ────────────────────────────────────────────────────
 _RE_NN_SUFFIX = re.compile(r"_\d+$")
 
-# ── Globals for fork-based parallel call-stack workers ──────────────────────
-# Set in the main process immediately before spawning a Pool; inherited
-# copy-on-write by forked children so no pickling of large event dicts.
-_CS_EVENTS_BY_UID: dict = {}
-_CS_STRIP_NN_SUFFIX: bool = False
-
-
-def _cs_process_group(uid_list: list) -> tuple:
+def _cs_process_group(args: tuple) -> tuple:
     """Process one (pid,tid) group of events for call-stack tree building.
 
-    ``uid_list`` contains event UIDs pre-sorted by timestamp for a single
-    (pid,tid) thread.  The function reads events from the module-global
-    ``_CS_EVENTS_BY_UID`` dict (set by the caller before fork) and returns
-    compact mutation data rather than modifying the shared dicts in place.
+    ``args`` is a ``(uid_list, compact_events)`` tuple where:
+    - ``uid_list`` contains event UIDs pre-sorted by timestamp for a single
+      (pid,tid) thread.
+    - ``compact_events`` is a dict mapping uid -> dict with keys
+      ``ts``, ``t_end``, ``name``, ``cat`` (the only fields this function reads).
+
+    Compact events are pre-partitioned per group by the caller so each worker
+    receives only its own ~N/K events rather than the full event set.  This
+    avoids the CPython refcount-triggered CoW page dirtying that occurs when
+    forked workers read from a shared events_by_uid dict.
 
     Returns
     -------
@@ -45,13 +44,13 @@ def _cs_process_group(uid_list: list) -> tuple:
         cpu_root_uids   – list of UIDs that are cpu_op roots (timestamp order)
         name_to_uids    – {name: [uid, ...]}
     """
+    uid_list, events_by_uid = args
+
     _TS = "ts"
     _TE = "t_end"
-    _UID = "UID"
     _NAME = "name"
 
-    events_by_uid = _CS_EVENTS_BY_UID
-    strip_nn_suffix = _CS_STRIP_NN_SUFFIX
+    strip_nn_suffix = True
 
     patches: dict = {}
     children_to_add: dict = defaultdict(list)
@@ -788,11 +787,10 @@ class TraceToTree:
     # TODO base class includes this, remove
     def build_host_call_stack_tree(self, add_python_func=False):
         # 1. Filter events and group by (pid, tid) thread.
-        # 2. If multiple threads exist, process each group in parallel (fork pool).
+        # 2. If multiple threads exist, process each group in parallel (spawn pool).
         #    Each worker is independent — threads never share stack state.
         # 3. Merge mutation results back into self.events_by_uid serially.
         # 4. Single-thread traces fall back to the serial per-event loop.
-        global _CS_EVENTS_BY_UID, _CS_STRIP_NN_SUFFIX
         tqdm.write(f"Building CPU op tree with add_python_func={add_python_func}")
         self.add_python_func = add_python_func
 
@@ -822,17 +820,44 @@ class TraceToTree:
 
         if n_groups > 1:
             # ── Parallel path: one worker per (pid,tid) thread ───────────────
-            _CS_EVENTS_BY_UID = self.events_by_uid
-            _CS_STRIP_NN_SUFFIX = True
+            # Each worker receives only its own group's events as a compact dict
+            # (ts, t_end, name, cat only).  This avoids the CPython refcount
+            # CoW problem: forked workers touching a shared events_by_uid dict
+            # dirty every page they read, causing full physical copies of the
+            # entire event set per worker (observed: 10 workers × 26 GB = 260 GB
+            # RSS on a 10M-event trace).  With spawn + pre-partitioned compact
+            # dicts, each worker receives only ~N/K events via pickle.
             n_workers = min(n_groups, os.cpu_count() or 1)
             tqdm.write(
                 f"  Parallel call-stack: {n_groups} threads, {n_workers} workers"
             )
-            ctx = _multiprocessing.get_context("fork")
+
+            _full = self.events_by_uid
+
+            def _group_args():
+                """Yield (uid_list, compact_events) one group at a time.
+
+                Building compact dicts lazily keeps peak memory proportional to
+                one group rather than all groups simultaneously.
+                """
+                for uid_list in sorted_groups:
+                    compact = {
+                        uid: {
+                            "ts": ev["ts"],
+                            "t_end": ev["t_end"],
+                            "name": ev["name"],
+                            "cat": ev.get("cat"),
+                        }
+                        for uid in uid_list
+                        for ev in (_full[uid],)
+                    }
+                    yield (uid_list, compact)
+
+            ctx = _multiprocessing.get_context("spawn")
             with ctx.Pool(n_workers) as pool:
                 results = list(
                     tqdm(
-                        pool.imap(_cs_process_group, sorted_groups),
+                        pool.imap(_cs_process_group, _group_args()),
                         total=n_groups,
                         desc="    Call stack",
                         unit="thread",
@@ -860,13 +885,9 @@ class TraceToTree:
             return
 
         # ── Serial fallback: single (pid,tid) thread or empty trace ─────────
-        # Re-uses _cs_process_group so logic stays in one place; the tqdm bar
-        # wraps the UID list to give event-level progress.
-        _CS_EVENTS_BY_UID = self.events_by_uid
-        _CS_STRIP_NN_SUFFIX = True
+        # Pass the full events_by_uid — no fork involved, so no CoW risk.
+        # Wrap uid_list with tqdm for event-level progress.
         uid_list = sorted_groups[0] if sorted_groups else []
-
-        # Wrap uid_list with tqdm for event-level progress on single-thread traces
         tracked = tqdm(
             uid_list,
             desc="    Call stack",
@@ -874,11 +895,8 @@ class TraceToTree:
             leave=False,
             dynamic_ncols=True,
         )
-        # Temporarily swap uid_list for the tracked version inside _cs_process_group
-        # by passing a tqdm-wrapped iterable.  We do the loop inline here so we can
-        # reuse the exact same logic path.
         patches, children_to_add, cpu_root_uids, name_to_uids = _cs_process_group(
-            tracked
+            (tracked, self.events_by_uid)
         )
         tracked.close()
 
