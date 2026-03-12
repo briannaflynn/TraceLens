@@ -974,29 +974,58 @@ class TraceToTree:
         )
 
         # ── Phase C: single bottom-up propagation of gpu_events ───────────────
-        # Replace the per-kernel O(depth) ancestor walk with one BFS topo pass.
         # Each event's gpu_events list is extended to its parent exactly once,
         # using C-level list.extend() instead of per-element Python append().
-        # This is 10-50× faster and avoids the GC pressure of millions of
-        # individual append() allocations.
+        #
+        # BFS seeds: use self.cpu_root_nodes directly instead of scanning all
+        # self.events for parentless non-GPU events.  This avoids an O(N_all)
+        # pass and — critically — avoids pulling in unrelated stray events
+        # (metadata, flow, ac2g) that were never part of the call-stack tree.
+        #
+        # Visited set: in merged multi-rank traces, overlapping correlation IDs
+        # cause Phase B to add the same GPU event as a child of multiple runtime
+        # events (one per rank).  Without a visited set the BFS enqueues each
+        # duplicate K times (K = number of ranks), making traversal
+        # O(K² × N_gpu) — a definite hang for large merged traces.
         tqdm.write("  add_gpu_ops_to_tree: propagating gpu_events up the tree (BFS)")
         from collections import deque
+        import time as _time
 
-        roots = [
-            e
-            for e in self.events
-            if e.get("parent") is None
-            and self.event_to_category(e) not in gpu_cats
-        ]
+        tqdm.write(
+            f"  add_gpu_ops_to_tree: BFS seeds = {len(self.cpu_root_nodes):,} cpu_root_nodes"
+        )
         topo_order: list = []
-        q: deque = deque(roots)
+        visited: set = set()
+        q: deque = deque(
+            events_by_uid[uid]
+            for uid in self.cpu_root_nodes
+            if uid in events_by_uid
+        )
+        tqdm.write(f"  add_gpu_ops_to_tree: BFS start — queue size = {len(q):,}")
+        _bfs_report_interval = 1_000_000
+        _bfs_next_report = _bfs_report_interval
+        _bfs_t0 = _time.monotonic()
+        bfscount = 0
         while q:
             ev = q.popleft()
+            ev_uid = ev[UID]
+            if ev_uid in visited:
+                continue
+            visited.add(ev_uid)
             topo_order.append(ev)
             for child_uid in ev.get("children", ()):
-                child = events_by_uid.get(child_uid)
-                if child is not None:
-                    q.append(child)
+                if child_uid not in visited:
+                    child = events_by_uid.get(child_uid)
+                    if child is not None:
+                        q.append(child)
+                        bfscount += 1
+            if bfscount >= _bfs_next_report:
+                elapsed = _time.monotonic() - _bfs_t0
+                tqdm.write(
+                    f"  add_gpu_ops_to_tree: BFS {bfscount:,} enqueued, "
+                    f"{len(topo_order):,} visited, q={len(q):,}, {elapsed:.1f}s"
+                )
+                _bfs_next_report += _bfs_report_interval
 
         tqdm.write(
             f"  add_gpu_ops_to_tree: propagating over {len(topo_order):,} reachable events"
