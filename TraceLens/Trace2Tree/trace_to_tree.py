@@ -913,7 +913,15 @@ class TraceToTree:
             self.name2event_uids[name].extend(uids)
 
     def add_gpu_ops_to_tree(self):
-        for runtime_event in self.events:
+        n_events = len(self.events)
+        tqdm.write(f"  add_gpu_ops_to_tree: scanning {n_events:,} events")
+        linked = 0
+        for runtime_event in tqdm(
+            self.events,
+            desc="  GPU ops → tree",
+            unit="ev",
+            mininterval=2.0,
+        ):
             if self.event_to_category(runtime_event) not in {
                 "cuda_runtime",
                 "cuda_driver",
@@ -938,6 +946,7 @@ class TraceToTree:
                 runtime_event.setdefault("gpu_events", []).append(
                     gpu_evt[TraceLens.util.TraceEventUtils.TraceKeys.UID]
                 )
+                linked += 1
 
                 parent = self.get_parent_event(runtime_event)
                 while parent:
@@ -945,13 +954,19 @@ class TraceToTree:
                         gpu_evt[TraceLens.util.TraceEventUtils.TraceKeys.UID]
                     )
                     parent = self.get_parent_event(parent)
+        tqdm.write(f"  add_gpu_ops_to_tree: done — {linked:,} GPU kernels linked")
 
     # TODO base class includes this, remove
     def label_non_gpu_paths(self):
         # 1. Iterate through non GPU nodes and chck the gpu_events list
         # 2. If the gpu_events list is empty, mark the node as non_gpu_path
-
-        for event in self.events:
+        tqdm.write(f"  label_non_gpu_paths: scanning {len(self.events):,} events")
+        for event in tqdm(
+            self.events,
+            desc="  Label non-GPU paths",
+            unit="ev",
+            mininterval=2.0,
+        ):
             # Skip GPU events
             cat = event.get("cat")
             if cat in {"kernel", "gpu_memset", "gpu_memcpy"}:
@@ -959,17 +974,21 @@ class TraceToTree:
             # Now, we are dealing with non-GPU events
             if "gpu_events" not in event:
                 event["non_gpu_path"] = True
+        tqdm.write("  label_non_gpu_paths: done")
 
     def build_tree(self, add_python_func=False, link_fwd_bwd=True) -> None:
         tqdm.write(f"Building tree with add_python_func={add_python_func}")
         self.build_host_call_stack_tree(add_python_func)
+        tqdm.write("  build_host_call_stack_tree: done")
         self.add_gpu_ops_to_tree()
 
         if self.prune_nongpu_paths:
             self.label_non_gpu_paths()
 
         if link_fwd_bwd:
+            tqdm.write("  link_all_fwd_bwd_events: starting")
             self.link_all_fwd_bwd_events()
+            tqdm.write("  link_all_fwd_bwd_events: done")
 
     # TODO base class includes this, remove
     def get_UID2event(self, UID):
