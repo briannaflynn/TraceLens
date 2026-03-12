@@ -10,7 +10,6 @@ import json
 import os
 import subprocess
 import sys
-import time
 import warnings
 from typing import Dict, Optional, Tuple
 
@@ -20,39 +19,6 @@ from tqdm import tqdm
 
 from TraceLens import NcclAnalyser, TraceToTree, TreePerfAnalyzer
 from TraceLens.Reporting.reporting_utils import request_install
-
-
-def _rss_mb() -> float:
-    """Return current RSS in MB by reading /proc/self/status (Linux only)."""
-    try:
-        with open("/proc/self/status") as _f:
-            for _line in _f:
-                if _line.startswith("VmRSS:"):
-                    return int(_line.split()[1]) / 1024
-    except Exception:
-        pass
-    return 0.0
-
-
-def _virt_mb() -> float:
-    """Return current VIRT in MB by reading /proc/self/status (Linux only)."""
-    try:
-        with open("/proc/self/status") as _f:
-            for _line in _f:
-                if _line.startswith("VmSize:"):
-                    return int(_line.split()[1]) / 1024
-    except Exception:
-        pass
-    return 0.0
-
-
-def _log(msg: str, t0: float) -> None:
-    """Print a timestamped progress line with elapsed time and current RSS/VIRT."""
-    elapsed = time.time() - t0
-    print(
-        f"[{elapsed:7.1f}s | RSS {_rss_mb():7.0f} MB | VIRT {_virt_mb():7.0f} MB] {msg}",
-        flush=True,
-    )
 
 
 def get_dfs_short_kernels(
@@ -293,8 +259,7 @@ def generate_perf_report_pytorch(
     else:
         gpu_arch_json = None
 
-    t0 = time.time()
-    _log(f"START generate_perf_report_pytorch | trace={profile_json_path}", t0)
+    print("Starting generate_perf_report_pytorch")
 
     stages = [
         "Load & build tree",
@@ -308,7 +273,7 @@ def generate_perf_report_pytorch(
     ]
     progress = tqdm(total=len(stages), desc=stages[0], unit="stage", dynamic_ncols=True)
 
-    _log("Stage 1/8: Load & build tree — starting TreePerfAnalyzer.from_file()", t0)
+    print("Stage 1/8: Load & build tree")
     perf_analyzer = TreePerfAnalyzer.from_file(
         profile_filepath=profile_json_path,
         arch=gpu_arch_json,
@@ -317,7 +282,7 @@ def generate_perf_report_pytorch(
         enable_pseudo_ops=enable_pseudo_ops,
         detect_recompute=detect_recompute,
     )
-    _log(f"Stage 1/8: Load & build tree — done | events={len(perf_analyzer.tree.events):,}", t0)
+    print(f"Stage 1/8: done — {len(perf_analyzer.tree.events):,} events loaded")
 
     ## Apply annotation for vLLM eager and replay phase
     perf_analyzer.tree.apply_annotation(
@@ -338,11 +303,11 @@ def generate_perf_report_pytorch(
     # Generate base DataFrames
     progress.update(1)
     progress.set_description(stages[1])
-    _log("Stage 2/8: GPU timeline — starting get_df_gpu_timeline()", t0)
+    print("Stage 2/8: GPU timeline")
     df_gpu_timeline = perf_analyzer.get_df_gpu_timeline(
         micro_idle_thresh_us=micro_idle_thresh_us
     )
-    _log(f"Stage 2/8: GPU timeline — done | rows={len(df_gpu_timeline):,}", t0)
+    print("Stage 2/8: done")
 
     # TODO: move this to the TreePerfAnalyzer class
     total_time_row = df_gpu_timeline[df_gpu_timeline["type"] == "total_time"]
@@ -361,16 +326,16 @@ def generate_perf_report_pytorch(
     progress.update(1)
     progress.set_description(stages[2])
     if not perf_analyzer.gpu_only:
-        _log("Stage 3/8: Kernel launchers — starting get_df_kernel_launchers()", t0)
+        print("Stage 3/8: Kernel launchers")
         df_kernel_launchers = perf_analyzer.get_df_kernel_launchers(
             include_kernel_details=True,
             include_first_occurrence_time=include_first_occurrence_time,
         )
-        _log(f"Stage 3/8: Kernel launchers — done | rows={len(df_kernel_launchers):,}", t0)
+        print(f"Stage 3/8: done — {len(df_kernel_launchers):,} launcher rows")
 
         progress.update(1)
         progress.set_description(stages[3])
-        _log("Stage 4/8: Launcher summaries — starting", t0)
+        print("Stage 4/8: Launcher summaries")
         df_kernel_launchers_summary = perf_analyzer.get_df_kernel_launchers_summary(
             df_kernel_launchers
         )
@@ -389,14 +354,14 @@ def generate_perf_report_pytorch(
             source_col="kernel_details_summary",
             new_col_name="trunc_kernel_details",
         )
-        _log(f"Stage 4/8: Launcher summaries — done | ops_summary rows={len(df_kernel_launchers_summary):,}", t0)
+        print("Stage 4/8: done")
 
         # Dictionary to hold the op-specific DataFrames
         perf_metrics_dfs = {}
 
         progress.update(1)
         progress.set_description(stages[4])
-        _log(f"Stage 5/8: Per-op perf metrics — starting ({len(perf_analyzer.dict_cat2names)} categories)", t0)
+        print("Stage 5/8: Per-op perf metrics")
         for op_cat, op_names in tqdm(
             perf_analyzer.dict_cat2names.items(),
             desc="  Op categories",
@@ -494,7 +459,7 @@ def generate_perf_report_pytorch(
                 if not df_ops_bwd.empty:
                     perf_metrics_dfs[f"{op_cat}_bwd"] = df_ops_bwd
 
-        _log(f"Stage 5/8: Per-op perf metrics — done | {len(perf_metrics_dfs)} op tables built", t0)
+        print("Stage 5/8: done")
 
     # Short kernel study (works for both GPU-only and regular traces)
     if short_kernel_study:
@@ -522,7 +487,7 @@ def generate_perf_report_pytorch(
         # Add unified perf metrics table (ops with perf models + leaf ops with GPU kernels)
         progress.update(1)
         progress.set_description(stages[5])
-        _log("Stage 6/8: Unified perf table — starting build_df_unified_perf_table()", t0)
+        print("Stage 6/8: Unified perf table")
         df_unified_perf = perf_analyzer.build_df_unified_perf_table()
         if not df_unified_perf.empty:
             df_unified_perf_summary = perf_analyzer.summarize_df_unified_perf_table(
@@ -536,7 +501,7 @@ def generate_perf_report_pytorch(
                 )
                 dict_name2df["unified_perf_summary"] = df_unified_perf_summary
 
-        _log(f"Stage 6/8: Unified perf table — done | rows={len(df_unified_perf) if not df_unified_perf.empty else 0:,}", t0)
+        print("Stage 6/8: done")
         # update this dict with the perf_metrics_dfs
         dict_name2df.update(perf_metrics_dfs)
 
@@ -639,13 +604,13 @@ def generate_perf_report_pytorch(
     # Skip collective analysis for GPU-only traces (no CPU ops means no collectives)
     progress.update(1)
     progress.set_description(stages[6])
-    _log("Stage 7/8: Collective analysis — starting", t0)
+    print("Stage 7/8: Collective analysis")
     if collective_analysis and not perf_analyzer.gpu_only:
         nccl_analyser = NcclAnalyser([profile_json_path], None)
         df_nccl_summary = nccl_analyser.build_df_summary_long()
         if not df_nccl_summary.empty:
             dict_name2df["coll_analysis"] = df_nccl_summary
-    _log("Stage 7/8: Collective analysis — done", t0)
+    print("Stage 7/8: done")
 
     # Get additional DataFrames from extension if available
     if extension_file:
@@ -668,7 +633,7 @@ def generate_perf_report_pytorch(
     # Write all DataFrames to separate sheets in an Excel workbook
     progress.update(1)
     progress.set_description(stages[7])
-    _log(f"Stage 8/8: Write output — starting | {len(dict_name2df)} sheets", t0)
+    print("Stage 8/8: Write output")
     if output_csvs_dir:
         # Ensure the output directory exists
         os.makedirs(output_csvs_dir, exist_ok=True)
@@ -694,7 +659,7 @@ def generate_perf_report_pytorch(
 
     progress.update(1)
     progress.close()
-    _log("DONE generate_perf_report_pytorch", t0)
+    print("Done")
     return dict_name2df
 
 
