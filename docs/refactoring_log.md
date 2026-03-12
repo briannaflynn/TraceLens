@@ -957,3 +957,275 @@ if n_groups > 1:
 
 **Validation:** `python -m pytest tests/test_perf_report_regression.py -v`
 Result: **13/13 passed**
+
+---
+
+## Pass 5b — Fix CoW memory explosion in parallel call-stack workers (2026-03-11)
+
+**Goal:** The fork-based parallel call-stack builder from Pass 5 caused ~260 GB RSS
+on a 10M-event trace because CPython's reference counting dirtied every shared
+page in the forked workers, defeating copy-on-write.
+
+**File:** `TraceLens/Trace2Tree/trace_to_tree.py`
+
+### Problem
+
+When a forked worker reads from the parent's `events_by_uid` dict (10M entries),
+every dict access bumps a reference count, which writes to the memory page
+containing that object.  CPython's refcounting turns copy-on-write into
+copy-on-read: the OS must make a private physical copy of every page touched,
+so each worker's RSS approaches the parent's full heap size (~26 GB × 10 workers
+= 260 GB).
+
+### Fix — Switch to spawn + pre-partitioned compact events
+
+Two changes:
+
+1. **Spawn instead of fork:** `multiprocessing.get_context("spawn")` starts
+   workers with a clean address space, so no CoW dirtying occurs.
+
+2. **Pre-partition compact event dicts:** Before dispatch, the main process builds
+   a compact dict (only `ts`, `t_end`, `name`, `cat`) for each worker's event
+   group and sends it via pickle.  Each worker receives only its `~N/K` events
+   rather than inheriting the full 10M-event address space.
+
+```python
+# Before: fork + module-global (full dict inherited by all workers)
+_CS_EVENTS_BY_UID = self.events_by_uid          # 10M events, every worker reads all of it
+ctx = get_context("fork")
+pool.imap(_cs_process_group, sorted_groups)     # each group is just a uid list
+
+# After: spawn + per-group compact dict (only this group's events pickled)
+def _build_compact(uid_list):
+    return (uid_list, {uid: {"ts": ..., "t_end": ..., "name": ..., "cat": ...}
+                       for uid in uid_list})
+ctx = get_context("spawn")
+pool.map(_cs_process_group, [_build_compact(g) for g in batch])
+```
+
+**Memory impact (10M-event trace):**
+
+| Strategy | Peak RSS |
+|---|---|
+| Fork + global dict | ~260 GB |
+| Spawn + compact per-group dict | ~26 GB |
+
+---
+
+### Supporting change — Batch spawn workers to bound peak memory
+
+Even with spawn + compact dicts, submitting all K groups at once holds K compact
+dicts + K result sets simultaneously in memory.  Workers are now dispatched in
+explicit batches of `n_workers=2`: each batch builds compact dicts for only 2
+groups, runs `pool.map`, merges results, then frees before starting the next batch.
+
+```python
+for batch_start in range(0, n_groups, n_workers):
+    batch = sorted_groups[batch_start : batch_start + n_workers]
+    batch_args = [_build_compact(uid_list) for uid_list in batch]
+    with ctx.Pool(len(batch)) as pool:
+        batch_results = pool.map(_cs_process_group, batch_args)
+    # merge + free before next batch
+```
+
+Peak memory is now `main process + 2 × per-group overhead` regardless of total
+group count.
+
+---
+
+## Pass 6 — Eliminate fork + O(subtree) per-launcher traversal in tree_perf (2026-03-11)
+
+**Goal:** Remove the fork-based parallel pool in `get_kernel_launchers` (added in
+Pass 3) and replace the O(subtree_size × N_launchers) subtree traversal with an
+O(1) lookup.
+
+**File:** `TraceLens/TreePerf/tree_perf.py`
+
+### Root cause
+
+`get_kernel_launchers` computed each launcher's subtree GPU kernels by calling
+`loop_and_aggregate_kernels()` — a full recursive subtree traversal — for every
+launcher.  With N_launchers launchers this is O(subtree_size × N_launchers).
+
+The fork-based parallel pool (Pass 3) hid the cost but introduced its own
+memory overhead via CoW page-dirtying (same mechanism as Pass 5b).
+
+### Fix
+
+`add_gpu_ops_to_tree` (Pass 7, below) already propagates every GPU kernel UID
+up to all CPU/runtime ancestors and stores them in `event["gpu_events"]` during
+tree construction.  This makes the subtree lookup O(1):
+
+```python
+# Before: O(subtree_size) recursive traversal per launcher
+subtree_kernel_uids = self.loop_and_aggregate_kernels([launcher_event])
+
+# After: O(1) direct field lookup (populated by add_gpu_ops_to_tree)
+subtree_kernel_uids = launcher_event.get("gpu_events", [])
+```
+
+**Symbols removed:** `_PARALLEL_LAUNCHER_THRESHOLD`, `_FORK_ANALYZER`,
+`_FORK_LAUNCHER_KERNELS`, `_compute_launcher_metrics_fork`, `import multiprocessing`
+
+**Result:** `get_kernel_launchers` runs serially with negligible per-launcher cost
+(just a dict field lookup + `GPUEventAnalyser` interval merge), with no fork
+overhead or memory blowup.
+
+---
+
+## Pass 7 — Eliminate O(N×depth) bottleneck in add_gpu_ops_to_tree (2026-03-12)
+
+**Goal:** Fix a hang in `add_gpu_ops_to_tree` that caused a 10M-event trace to
+run for 3.6+ hours and grow to 127+ GB VIRT.
+
+**File:** `TraceLens/Trace2Tree/trace_to_tree.py` — `TraceToTree.add_gpu_ops_to_tree`
+
+### What the function does
+
+`add_gpu_ops_to_tree` connects the bottom of the call-stack tree — attaching GPU
+kernels as children of the CPU runtime events that launched them, then propagating
+that information upward so every ancestor node knows which GPU kernels ran
+"under" it.  This `gpu_events` field is what lets `get_kernel_launchers` answer
+"what GPU kernels does this op own?" in O(1) (Pass 6).
+
+### Two root causes
+
+**Root cause 1 — O(N_all) scan per graph-launch event:**
+`_get_graph_gpu_events()` was called for every `cudaGraphLaunch` event and
+performed a full O(N_all) linear scan to find matching GPU kernels.  With many
+graph launches this is O(N_graph_launches × N_all).
+
+**Root cause 2 — O(depth) ancestor walk per GPU kernel:**
+After linking each GPU kernel to its runtime parent, the old code walked UP the
+tree from that kernel, appending its UID to every ancestor individually:
+
+```python
+# Old: per-kernel upward walk — O(N_gpu × depth) individual list.append() calls
+while parent:
+    parent.setdefault("gpu_events", []).append(gpu_uid)
+    parent = events_by_uid.get(parent.get("parent"))
+```
+
+For 1M GPU kernels at depth 10, this is 10M Python `list.append()` calls plus
+heavy GC pressure from all the intermediate list allocations.
+
+### Fix — Three-phase restructure
+
+**Phase A — Pre-build correlation → GPU index (fixes root cause 1):**
+```python
+corr_to_gpu_events: dict = {}
+for evt in self.events:
+    if category in gpu_cats:
+        corr = evt.get("args", {}).get("correlation")
+        if corr is not None:
+            corr_to_gpu_events.setdefault(corr, []).append(evt)
+# Each graph-launch lookup is now O(1)
+```
+
+**Phase B — Link each GPU kernel to its immediate runtime parent only.**
+No ancestor walk yet; `gpu_events` is set only on the direct runtime parent.
+
+**Phase C — Single bottom-up propagation via BFS topo-sort (fixes root cause 2):**
+```python
+# One BFS pass builds topo_order (roots → leaves)
+# One reverse pass propagates gpu_events upward with C-level list.extend()
+gc.disable()
+for event in reversed(topo_order):
+    if event.get("gpu_events") and event.get("parent") is not None:
+        parent["gpu_events"].extend(event["gpu_events"])  # O(1) C-level extend
+gc.enable()
+```
+
+`list.extend()` is a C-level bulk copy, 10-50× faster than individual
+`list.append()` calls, and GC is disabled during the loop to eliminate cyclic
+collector overhead.
+
+**Complexity change:**
+
+| | Old | New |
+|---|---|---|
+| Graph-launch lookup | O(N_graph_launches × N_all) | O(1) per launch |
+| GPU events propagation | O(N_gpu × depth) appends | O(N_gpu × depth) bulk extend (C-level) |
+| Peak VIRT (10M trace) | 127+ GB | manageable |
+
+**Validation:** All reference xlsx files regenerated (kernel_details ordering
+changed to BFS insertion order; all numeric values identical).
+`python -m pytest tests/ -v` — **117 passed**
+
+---
+
+## Pass 8 — Fix O(K²×N_gpu) BFS hang for merged multi-rank traces (2026-03-12)
+
+**Goal:** Fix a hang in Phase C of `add_gpu_ops_to_tree` that occurred on large
+merged multi-rank/multi-GPU traces.
+
+**File:** `TraceLens/Trace2Tree/trace_to_tree.py` — `TraceToTree.add_gpu_ops_to_tree`
+
+### Root cause — Correlation ID collisions in merged traces
+
+When PyTorch profiles a single rank, every GPU kernel launch is assigned a
+correlation ID that is unique within that profiling session.  When traces from K
+ranks are merged into one file, each rank brings its own correlation IDs —
+and those IDs restart from the same range every time.
+
+Phase A builds `corr_to_gpu_events[corr]` by scanning all events.  In a merged
+trace, the bucket for a given correlation ID accumulates GPU kernels from **all K
+ranks**, not just one.  Phase B then links ALL of those kernels as children of
+every runtime event that carries that correlation — so each runtime event claims
+K times as many GPU children as it should.
+
+In the BFS (Phase C), each GPU kernel therefore appears in K parents' `children`
+lists and is enqueued K times.  Without a visited set, the BFS processes it K
+times, making total traversal work **O(K² × N_gpu)** instead of O(N_gpu).
+
+For K = 64 ranks this is ~4,000× more work than necessary — a definite hang.
+
+### Fix — Two changes to the Phase C BFS
+
+**1. Seed BFS from `cpu_root_nodes` directly:**
+
+The old code scanned all `self.events` (O(N_all)) to find parentless non-GPU
+events as BFS seeds.  `self.cpu_root_nodes` is already populated by
+`build_host_call_stack_tree` and contains exactly the right seeds — no scan needed.
+
+```python
+# Before: O(N_all) scan
+roots = [e for e in self.events if e.get("parent") is None
+         and self.event_to_category(e) not in gpu_cats]
+
+# After: O(N_roots) direct lookup — no scan, no stray events
+q = deque(events_by_uid[uid] for uid in self.cpu_root_nodes
+          if uid in events_by_uid)
+```
+
+**2. Add a visited set:**
+
+```python
+visited: set = set()
+while q:
+    ev = q.popleft()
+    ev_uid = ev[UID]
+    if ev_uid in visited:       # ← skip duplicates from cross-rank children lists
+        continue
+    visited.add(ev_uid)
+    topo_order.append(ev)
+    for child_uid in ev.get("children", ()):
+        if child_uid not in visited:
+            q.append(events_by_uid[child_uid])
+```
+
+Each event is now processed exactly once regardless of how many parents claim it
+as a child.  The K² blowup collapses back to O(K × N_gpu) (linear).
+
+**Complexity change:**
+
+| | Before | After |
+|---|---|---|
+| Root-finding | O(N_all) scan | O(N_roots) direct lookup |
+| BFS traversal | O(K² × N_gpu) — hang for K ≥ 64 | O(N_gpu) |
+
+**Note:** The visited set prevents the hang but does not fix incorrect cross-rank
+GPU event attribution for `cudaGraphLaunch` events (a correctness issue separate
+from the hang; tracked for future work).
+
+**Validation:** `python -m pytest tests/ -v` — **117 passed**
